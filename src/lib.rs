@@ -5,6 +5,10 @@ use std::str;
 use xml::reader::{EventReader, XmlEvent};
 use serde_json::{Value};
 use serde_json::map::Map;
+//use std::cell::RefCell;
+//use std::rc::Rc;
+use std::collections::BTreeSet;
+use polars::prelude::*;
 
 // src/lib.rs
 
@@ -125,6 +129,19 @@ impl Record {
     fn add_child(&mut self, rec: Record) {
         self.structure.push(rec);
     }
+    fn get_record(&self,name: &str) -> Option<&Record> {
+        for x in &self.structure{
+            if x.element == name{
+                return Some(x);
+            }
+        }
+        return None;
+    }
+    fn get(&self,name: &str) -> Option<&String>{
+        self.get_record(name).map(
+          |x| &x.text,
+        )
+    }
     fn to_json(&self) -> Value{
         if self.is_struct {
             if is_array(&self.element) {
@@ -150,21 +167,95 @@ impl Record {
     }
 }
 
-struct RecordIterator<R: Read> {
+struct Batch(Vec<Record>);
+
+impl Batch{
+    fn new() -> Self{
+        Batch(vec![])
+    }
+
+    fn column_series(&self, name:&str) -> Series{
+        Series::new(name, self.0.iter().map(
+            |r| {
+                if let Some(r) = r.get_record(name){
+                    if r.is_struct{
+                        r.to_json().to_string()
+                    }
+                    else{
+                        r.text.to_string()
+                    }    
+                }
+                else{
+                    "".to_owned()
+                } 
+            }
+        ).collect::<Vec<String>>())
+    } 
+
+    fn columns(&self)->BTreeSet<String>{
+        let mut set = BTreeSet::new();
+        for r in &self.0{
+            for e in &r.structure{
+                set.insert(e.element.to_string());
+            }
+        }
+        return set;
+    }
+
+    fn dataframe(&self)->Result<DataFrame, PolarsError>{
+        DataFrame::new(
+          self.columns().iter().map(
+              |x| self.column_series(x)
+          ).collect::<Vec<_>>()
+        )
+    }
+
+    fn from_iter(it:&mut impl Iterator<Item=Record>, elements:usize)->Option<Self>{
+        let mut batch = Batch::new();
+        batch.fill(it, elements);
+        if batch.is_empty(){
+            None
+        }
+        else{
+            Some(batch)
+        }
+    }
+
+    fn fill(&mut self, it:&mut impl Iterator<Item=Record>, elements:usize){
+        for i in 0..elements{
+            if let Some(r) = it.next(){
+                self.0.push(r);
+            }
+            else{
+                break;
+            }
+        }
+    }
+    fn len(&self) -> usize{
+        self.0.len()
+    }
+    fn is_empty(&self)->bool{
+        self.0.is_empty()
+    }
+    fn to_json(&self)-> Value{
+        Value::Array(self.0.iter().map(|x| x.to_json()).collect())
+    }
+}
+struct PlainRecordIterator<R: Read> {
     event_reader: EventReader<R>,
     stack: Vec<Record>,
 }
 
-impl<R: Read> RecordIterator<R> {
+impl<R: Read> PlainRecordIterator<R> {
     fn from_reader(reader: R) -> Self {
-        RecordIterator {
+        PlainRecordIterator {
             event_reader: EventReader::new(reader),
             stack: Vec::new(),
         }
     }
 }
 
-impl<R: Read> Iterator for RecordIterator<R> {
+impl<R: Read> Iterator for PlainRecordIterator<R> {
     type Item = Record;
     fn next(&mut self) -> Option<Self::Item> {
         loop{
@@ -207,14 +298,37 @@ impl<R: Read> Iterator for RecordIterator<R> {
     }
 }
 
-fn record_iterator_from_xml_file(path: &str) -> Result<RecordIterator<impl Read>> {
+fn record_iterator_from_xml_file(path: &str) -> Result<PlainRecordIterator<BufReader<File>>> {
     let file = File::open(path)?;
-    Ok(RecordIterator::from_reader(BufReader::new(file)))
+    Ok(PlainRecordIterator::from_reader(BufReader::new(file)))
+}
+/*
+struct ZipRecordIterator<'a, I: Read> {
+    archive: Rc<RefCell<zip::ZipArchive<I>>>,
+    file_inside_zip: zip::read::ZipFile<'a>,
+    //it:PlainRecordIterator<R>,
 }
 
-fn record_iterator_from_zip_file(path: &str) -> Result<RecordIterator<impl Read>> {
-    let file = File::open(path)?;
-    Ok(RecordIterator::from_reader(BufReader::new(file)))
-}
+fn record_iterator_from_zip_file(path: &str) -> Result<ZipRecordIterator<'_,impl Read>>{
+    let mut f = File::open(path)?;
+    let mut archive = Rc::new(RefCell::new(zip::ZipArchive::new(f)?));
+    let mut barchive = archive.clone();
+    let mut bb = barchive.borrow_mut();
+    let mut file_inside_zip = bb.by_index(0)?;
 
+    Ok(ZipRecordIterator{
+        archive: archive,
+        file_inside_zip: file_inside_zip,
+        //it:PlainRecordIterator::from_reader(BufReader::new(file_inside_zip))
+    })
+}
+*/
+/*
+fn record_iterator_from_zip_file(path: &str) -> Result<PlainRecordIterator<impl Read>> {
+    let file = File::open(path)?;
+    let mut archive = Box::new(zip::ZipArchive::new(file)?);
+    let mut file_in_archive = Box::new(archive.by_index(0)?); 
+    Ok(PlainRecordIterator::from_reader(BufReader::new(&mut file_in_archive)))
+}
+*/
 mod python_module;
