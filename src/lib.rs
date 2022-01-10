@@ -4,10 +4,10 @@ use std::io::{BufReader, Read, Write};
 use std::str;
 use xml::reader::{EventReader, XmlEvent};
 use serde_json::{Value};
-use serde_json::map::Map;
+use serde_json::map::{Map};
 //use std::cell::RefCell;
 //use std::rc::Rc;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use polars::prelude::*;
 
 // src/lib.rs
@@ -167,6 +167,95 @@ impl Record {
     }
 }
 
+fn registered(r:&Record)->bool{
+    if let Some(status) = r.get("KoeretoejRegistreringStatus"){
+        status == "Registreret"
+    }
+    else{
+        false
+    }
+}
+
+fn flatten_json(json: &Value, failures:&mut HashMap<String,usize>) -> Value{
+    let mut flat = Map::new();
+    match json{
+        Value::Object(m) =>{
+            for (key, value) in m.iter(){
+                match flatten_json(value, failures){
+                    Value::Object(mm) => {                        
+                        for (key, value) in m.iter(){
+                            if flat.contains_key(key){
+                                *failures.entry(key.to_owned()).or_insert(0) += 1;
+                            }
+                            flat.insert(key.to_owned(),value.clone());
+                        }
+                    },
+                    _ =>{
+                        if flat.contains_key(key){
+                            *failures.entry(key.to_owned()).or_insert(0) += 1;
+                        }
+                        flat.insert(key.to_owned(),value.clone());
+                    }
+                }                
+            }
+            Value::Object(flat)
+        }
+        _ => json.clone()    
+    }
+}
+
+fn flatten_json_array(value: &Value, failures:&mut HashMap<String,usize>) -> Value{
+    match value{
+        Value::Array(a) =>{
+            Value::Array(a.iter().map(|x| flatten_json(x,failures)).collect())
+        },
+        _ =>{
+            flatten_json(&value, failures)
+        }
+    }
+}
+
+fn to_dict_of_lists(it:&[Value]) -> Value{
+    let mut arrays:HashMap<String, Vec<Value>> = HashMap::new();
+    for column in list_of_dicts_columns(it){
+        let mut v:Vec<Value> = Vec::new();
+        for row in it{
+            match row{
+                Value::Object(m)=>{
+                    v.push(m.get(&column).unwrap_or(&Value::Null).clone());
+                },
+                _ => {
+                    v.push(Value::Null);
+                }
+            }    
+        }
+        arrays.insert(column,v);
+    }
+
+    let mut m = Map::new();
+    for (k,v) in arrays.into_iter() {
+        m.insert(k,Value::Array(v));
+    }
+    Value::Object(m)
+}
+
+fn list_of_dicts_columns(it:&[Value]) -> BTreeSet<String>{
+    let mut set = BTreeSet::new();
+    for r in it{
+        match r{
+            Value::Object(m)=>{
+                for key in m.keys(){
+                    set.insert(key.to_string());
+                }
+            },
+            _ => {
+                println!("WARNING: Json object expected, {} obrained",r);
+            }
+        }
+    }
+    return set;
+}
+
 struct Batch(Vec<Record>);
 
 impl Batch{
@@ -220,11 +309,35 @@ impl Batch{
             Some(batch)
         }
     }
+    fn from_iter_registered(it:&mut impl Iterator<Item=Record>, elements:usize)->Option<Self>{
+        let mut batch = Batch::new();
+        batch.fill_registered(it, elements);
+        if batch.is_empty(){
+            None
+        }
+        else{
+            Some(batch)
+        }
+    }
 
     fn fill(&mut self, it:&mut impl Iterator<Item=Record>, elements:usize){
         for i in 0..elements{
             if let Some(r) = it.next(){
                 self.0.push(r);
+            }
+            else{
+                break;
+            }
+        }
+    }
+    fn fill_registered(&mut self, it:&mut impl Iterator<Item=Record>, elements:usize){
+        let mut i=0;
+        while i<elements{
+            if let Some(r) = it.next(){
+                if registered(&r){
+                    self.0.push(r);
+                    i+=1;
+                }                
             }
             else{
                 break;
@@ -332,3 +445,14 @@ fn record_iterator_from_zip_file(path: &str) -> Result<PlainRecordIterator<impl 
 }
 */
 mod python_module;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_add() {
+        let mut failures = HashMap::new();
+        flatten_json(json!())
+    }
+}
